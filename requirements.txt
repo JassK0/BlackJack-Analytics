@@ -1,0 +1,8 @@
+pandas
+numpy
+matplotlib
+pyyaml
+
+
+# pinned versions added by installer
+pandas==2.3.3
