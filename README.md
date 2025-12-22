@@ -144,6 +144,6 @@ Developed by **Jass Kahlon**.
 
 ### 🎯 Summary
 
-BlackJack-Analytics removes the mythology from blackjack strategy and replaces it with data. It does not tell you what “feels smart” — it tells you what **is** smart over hundreds or thousands of sessions.
+BlackJack-Analytics removes the mythology from blackjack strategy and replaces it with data. It does not tell you what “feels smart” , rather, it tells you what **is** smart over hundreds or thousands of sessions.
 
 If you want real blackjack insights backed by math instead of gambling folklore, this project gives you the tools.
