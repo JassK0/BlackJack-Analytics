@@ -18,6 +18,137 @@ except Exception:
 
 from strat2 import TableRules, BankrollConfig, StrategyConfig, run_session
 
+HANDS_COLS = [
+    "session_id", "strategy", "hand_idx", "stake", "before", "after",
+    "profit", "outcome", "player_total", "dealer_total",
+    "player_bj", "dealer_bj", "dealer_up", "player_len", "dealer_len",
+    "player_cards", "dealer_cards"
+]
+SESSION_COLS = [
+    "session_id", "strategy", "rounds", "final_bankroll", "net",
+    "win", "lose", "push", "win_rate", "avg_stake",
+    "max_drawdown", "table_max_hits", "bust", "rules"
+]
+
+# Composite ranking weights (adjustable)
+DEFAULT_WEIGHTS = {
+    'mean_net': 0.35,
+    'ev_per_hand': 0.10,
+    'std_net': 0.15,
+    'risk_of_ruin': 0.15,
+    'mean_drawdown': 0.10,
+    'win_rate': 0.15
+}
+# Metrics: higher is better list and lower-is-better list
+HIGHER_BETTER = ['mean_net', 'ev_per_hand', 'win_rate', 'median_net']
+LOWER_BETTER = ['std_net', 'risk_of_ruin', 'mean_drawdown']
+
+def hand_row(h, strategy):
+    """One hands.csv row for a strat2.HandLog."""
+    p_cards = ",".join(h.player_cards) if getattr(h, 'player_cards', None) else ""
+    d_cards = ",".join(h.dealer_cards) if getattr(h, 'dealer_cards', None) else ""
+    return {
+        "session_id": h.session_id, "strategy": strategy, "hand_idx": h.hand_idx,
+        "stake": h.stake, "before": h.bankroll_before, "after": h.bankroll_after,
+        "profit": h.profit, "outcome": h.outcome,
+        "player_total": h.player_total, "dealer_total": h.dealer_total,
+        "player_bj": h.player_bj, "dealer_bj": h.dealer_bj,
+        "dealer_up": h.dealer_up, "player_len": h.player_len, "dealer_len": h.dealer_len,
+        "player_cards": p_cards, "dealer_cards": d_cards
+    }
+
+def session_row(summary):
+    """One sessions.csv row for a strat2.SessionSummary."""
+    return {
+        "session_id": summary.session_id,
+        "strategy": summary.strategy,
+        "rounds": summary.rounds_played,
+        "final_bankroll": summary.final_bankroll,
+        "net": summary.net,
+        "win": summary.win, "lose": summary.lose, "push": summary.push,
+        "win_rate": summary.win_rate,
+        "avg_stake": summary.avg_stake,
+        "max_drawdown": summary.max_drawdown,
+        "table_max_hits": summary.table_max_hits,
+        "bust": summary.bust,
+        "rules": json.dumps(summary.rules)
+    }
+
+def ev_per_hand_table(df_h):
+    """EV per hand (approx): sum of profits / total hands, indexed by strategy."""
+    return (df_h.groupby("strategy")["profit"].sum() /
+            df_h.groupby("strategy")["profit"].count()).rename("ev_per_hand").to_frame()
+
+def rank_strategies(df, ev_per_hand=None, weights=None):
+    """Composite ranking of strategies from session results.
+
+    `ev_per_hand` maps strategy -> EV per hand (a Series or dict); missing means
+    the EV weight is redistributed over the other metrics. Returns the ranking
+    sorted best first, with min-max normalized metrics combined by `weights`.
+    """
+    # group metrics
+    g = df.groupby('strategy')
+    stats = pd.DataFrame({
+        'strategy': g.size().index,
+        'n_sessions': g.size().values,
+        'mean_net': g['net'].mean().values,
+        'std_net': g['net'].std(ddof=1).fillna(0).values,
+        'median_net': g['net'].median().values,
+        'win_rate': g['win_rate'].mean().values,
+        'mean_drawdown': g['max_drawdown'].mean().values,
+        'risk_of_ruin': g['final_bankroll'].apply(lambda s: (s <= 0).mean()).values
+    })
+    # align EV by strategy name
+    if ev_per_hand is not None:
+        stats['ev_per_hand'] = stats['strategy'].map(dict(ev_per_hand)).astype(float)
+    else:
+        stats['ev_per_hand'] = np.nan
+
+    # Normalization helpers
+    def minmax_norm(s):
+        if s.max() == s.min():
+            return pd.Series([0.5]*len(s), index=s.index)
+        return (s - s.min()) / (s.max() - s.min())
+
+    norm = pd.DataFrame({'strategy': stats['strategy']})
+    # normalize each metric; where NaN present keep NaN
+    for col in HIGHER_BETTER + LOWER_BETTER:
+        series = stats[col]
+        if series.isna().all():
+            norm[col+'_norm'] = np.nan
+            continue
+        # for lower is better, invert after min-max
+        if col in HIGHER_BETTER:
+            norm[col+'_norm'] = minmax_norm(series.fillna(series.min()))
+        else:
+            # invert: lower -> higher score
+            norm[col+'_norm'] = 1.0 - minmax_norm(series.fillna(series.max()))
+
+    weights = dict(DEFAULT_WEIGHTS if weights is None else weights)
+    # If ev_per_hand all-NaN, remove it and renormalize weights
+    if norm['ev_per_hand_norm'].isna().all() and 'ev_per_hand' in weights:
+        ev_w = weights.pop('ev_per_hand')
+        # distribute ev weight proportionally to remaining weights
+        total = sum(weights.values())
+        for k in weights:
+            weights[k] = weights[k] + weights[k] * (ev_w / total)
+
+    # Build composite score
+    score = pd.Series(0.0, index=stats.index)
+    for metric, w in weights.items():
+        col = metric + '_norm'
+        if col in norm.columns:
+            score = score + w * norm[col].fillna(0.0).values
+
+    stats['composite_score'] = score.values
+    stats['rank'] = stats['composite_score'].rank(ascending=False, method='min').astype(int)
+
+    ranking_cols = [
+        'n_sessions','mean_net','std_net','median_net','win_rate','risk_of_ruin','mean_drawdown','ev_per_hand','composite_score','rank'
+    ]
+    ranking = stats[['strategy'] + ranking_cols]
+    return ranking.sort_values('composite_score', ascending=False).reset_index(drop=True)
+
 def ci95(x):
     if len(x) == 0: return (np.nan, np.nan)
     m = np.mean(x); s = np.std(x, ddof=1) if len(x) > 1 else 0.0
@@ -32,9 +163,46 @@ def kelly_unit_est(ev_per_unit, var_per_unit):
     if var_per_unit <= 0: return np.nan
     return ev_per_unit / var_per_unit
 
+def kelly_analysis(df_hands, starting_bankroll):
+    """Kelly-criterion bet sizing per strategy, estimated from hand-level results.
+
+    Each hand's return is measured per unit staked (profit / stake). The Kelly
+    fraction is approximated as edge / variance (f* ~ mu / sigma^2), which is the
+    standard small-edge approximation. A negative fraction means the game has a
+    negative edge, so the growth-optimal bet is zero.
+    """
+    rows = []
+    for strat, g in df_hands.groupby("strategy"):
+        g = g[g["stake"] > 0]
+        r = (g["profit"] / g["stake"]).to_numpy(dtype=float)
+        n = len(r)
+        if n < 2:
+            continue
+        edge = float(np.mean(r))
+        var = float(np.var(r, ddof=1))
+        half = 1.96 * math.sqrt(var / n)
+        f = kelly_unit_est(edge, var)
+        f_bet = max(0.0, f) if not np.isnan(f) else np.nan
+        rows.append({
+            "strategy": strat,
+            "hands": n,
+            "edge_per_unit": edge,
+            "edge_ci_low": edge - half,
+            "edge_ci_high": edge + half,
+            "var_per_unit": var,
+            "kelly_fraction": f,
+            "kelly_bet": f_bet * starting_bankroll if not np.isnan(f_bet) else np.nan,
+            "edge_significant": (edge - half > 0) or (edge + half < 0),
+        })
+    return pd.DataFrame(rows)
+
 def run_experiment(args):
     outdir = args.outdir
     os.makedirs(outdir, exist_ok=True)
+    # clear Kelly output from any previous run so it is never mixed with new results
+    stale_kelly = os.path.join(outdir, "kelly.csv")
+    if os.path.exists(stale_kelly):
+        os.remove(stale_kelly)
 
     rules = TableRules(
         num_decks=args.decks, cut_card=args.cut,
@@ -71,32 +239,9 @@ def run_experiment(args):
 
             # write hand rows
             for h in handlogs:
-                p_cards = ",".join(h.player_cards) if getattr(h, 'player_cards', None) else ""
-                d_cards = ",".join(h.dealer_cards) if getattr(h, 'dealer_cards', None) else ""
-                all_hand_rows.append({
-                    "session_id": h.session_id, "strategy": summary.strategy, "hand_idx": h.hand_idx,
-                    "stake": h.stake, "before": h.bankroll_before, "after": h.bankroll_after,
-                    "profit": h.profit, "outcome": h.outcome,
-                    "player_total": h.player_total, "dealer_total": h.dealer_total,
-                    "player_bj": h.player_bj, "dealer_bj": h.dealer_bj,
-                    "dealer_up": h.dealer_up, "player_len": h.player_len, "dealer_len": h.dealer_len,
-                    "player_cards": p_cards, "dealer_cards": d_cards
-                })
+                all_hand_rows.append(hand_row(h, summary.strategy))
 
-            session_rows.append({
-                "session_id": summary.session_id,
-                "strategy": summary.strategy,
-                "rounds": summary.rounds_played,
-                "final_bankroll": summary.final_bankroll,
-                "net": summary.net,
-                "win": summary.win, "lose": summary.lose, "push": summary.push,
-                "win_rate": summary.win_rate,
-                "avg_stake": summary.avg_stake,
-                "max_drawdown": summary.max_drawdown,
-                "table_max_hits": summary.table_max_hits,
-                "bust": summary.bust,
-                "rules": json.dumps(summary.rules)
-            })
+            session_rows.append(session_row(summary))
             finals.append(summary.final_bankroll)
             nets.append(summary.net)
             dds.append(summary.max_drawdown)
@@ -115,19 +260,8 @@ def run_experiment(args):
     # Save CSVs (force headers so empty runs still produce parsable files)
     hands_csv = os.path.join(outdir, "hands.csv")
     sessions_csv = os.path.join(outdir, "sessions.csv")
-    hands_cols = [
-        "session_id", "strategy", "hand_idx", "stake", "before", "after",
-        "profit", "outcome", "player_total", "dealer_total",
-        "player_bj", "dealer_bj", "dealer_up", "player_len", "dealer_len",
-        "player_cards", "dealer_cards"
-    ]
-    session_cols = [
-        "session_id", "strategy", "rounds", "final_bankroll", "net",
-        "win", "lose", "push", "win_rate", "avg_stake",
-        "max_drawdown", "table_max_hits", "bust", "rules"
-    ]
-    pd.DataFrame(all_hand_rows, columns=hands_cols).to_csv(hands_csv, index=False)
-    pd.DataFrame(session_rows, columns=session_cols).to_csv(sessions_csv, index=False)
+    pd.DataFrame(all_hand_rows, columns=HANDS_COLS).to_csv(hands_csv, index=False)
+    pd.DataFrame(session_rows, columns=SESSION_COLS).to_csv(sessions_csv, index=False)
     print(f"Saved: {hands_csv}")
     print(f"Saved: {sessions_csv}")
 
@@ -156,11 +290,21 @@ def run_experiment(args):
         if df_h.empty:
             print("No hand data available to compute EV per hand.")
         else:
-            ev_table = (df_h.groupby("strategy")["profit"].sum() /
-                        df_h.groupby("strategy")["profit"].count()).rename("ev_per_hand").to_frame()
+            ev_table = ev_per_hand_table(df_h)
             ev_table.to_csv(os.path.join(outdir, "ev_per_hand.csv"))
             print("\nEV per hand:")
             print(ev_table.round(4))
+
+            # Kelly-criterion bet sizing from per-unit returns
+            kelly = kelly_analysis(df_h, args.starting)
+            if not kelly.empty:
+                kelly.to_csv(os.path.join(outdir, "kelly.csv"), index=False)
+                print("\nKelly criterion (per unit staked):")
+                print(kelly[["strategy", "hands", "edge_per_unit", "edge_ci_low", "edge_ci_high",
+                             "kelly_fraction", "kelly_bet"]].round(4).to_string(index=False))
+                if (kelly["kelly_fraction"] <= 0).all():
+                    print("Edge is negative for every strategy, so the Kelly-optimal bet is $0: "
+                          "betting systems change variance, not expected value.")
     except pd.errors.EmptyDataError:
         print("Hands CSV is empty or malformed; skipping EV per hand computation.")
 
@@ -171,92 +315,26 @@ def run_experiment(args):
         print(f"Could not read sessions CSV for ranking: {e}")
         return
 
-    # group metrics
-    g = df.groupby('strategy')
-    stats = pd.DataFrame({
-        'strategy': g.size().index,
-        'n_sessions': g.size().values,
-        'mean_net': g['net'].mean().values,
-        'std_net': g['net'].std(ddof=1).fillna(0).values,
-        'median_net': g['net'].median().values,
-        'win_rate': g['win_rate'].mean().values,
-        'mean_drawdown': g['max_drawdown'].mean().values,
-        'risk_of_ruin': (g.apply(lambda x: (x['final_bankroll'] <= 0).mean())).values
-    })
-
     # EV per hand if available
+    ev_per_hand = None
     ev_path = os.path.join(outdir, 'ev_per_hand.csv')
     if os.path.exists(ev_path):
         try:
-            ev_df = pd.read_csv(ev_path)
-            ev_map = ev_df['ev_per_hand'].to_dict()
-            # align by strategy
-            stats['ev_per_hand'] = stats['strategy'].map(ev_df['ev_per_hand'].to_dict()).fillna(np.nan)
+            # align by strategy name (the CSV is indexed by strategy)
+            ev_per_hand = pd.read_csv(ev_path, index_col='strategy')['ev_per_hand']
         except Exception:
-            stats['ev_per_hand'] = np.nan
-    else:
-        stats['ev_per_hand'] = np.nan
+            ev_per_hand = None
 
-    # Normalization helpers
-    def minmax_norm(s):
-        if s.max() == s.min():
-            return pd.Series([0.5]*len(s), index=s.index)
-        return (s - s.min()) / (s.max() - s.min())
+    ranking = rank_strategies(df, ev_per_hand)
 
-    # Metrics: higher is better list and lower-is-better list
-    higher_better = ['mean_net', 'ev_per_hand', 'win_rate', 'median_net']
-    lower_better = ['std_net', 'risk_of_ruin', 'mean_drawdown']
-
-    norm = pd.DataFrame({'strategy': stats['strategy']})
-    # normalize each metric; where NaN present keep NaN
-    for col in higher_better + lower_better:
-        series = stats[col]
-        norm_col = None
-        if series.isna().all():
-            norm[col+'_norm'] = np.nan
-            continue
-        # for lower is better, invert after min-max
-        if col in higher_better:
-            norm[col+'_norm'] = minmax_norm(series.fillna(series.min()))
-        else:
-            # invert: lower -> higher score
-            norm[col+'_norm'] = 1.0 - minmax_norm(series.fillna(series.max()))
-
-    # Default weights (adjustable)
-    weights = {
-        'mean_net': 0.35,
-        'ev_per_hand': 0.10,
-        'std_net': 0.15,
-        'risk_of_ruin': 0.15,
-        'mean_drawdown': 0.10,
-        'win_rate': 0.15
-    }
-
-    # If ev_per_hand all-NaN, remove it and renormalize weights
-    if norm['ev_per_hand_norm'].isna().all():
-        ev_w = weights.pop('ev_per_hand')
-        # distribute ev weight proportionally to remaining weights
-        total = sum(weights.values())
-        for k in weights:
-            weights[k] = weights[k] + weights[k] * (ev_w / total)
-
-    # Build composite score
-    score = pd.Series(0.0, index=stats.index)
-    for metric, w in weights.items():
-        col = metric + '_norm'
-        if col in norm.columns:
-            score = score + w * norm[col].fillna(0.0).values
-
-    stats = stats.set_index('strategy')
-    norm = norm.set_index('strategy')
-    stats['composite_score'] = score.values
-    stats['rank'] = stats['composite_score'].rank(ascending=False, method='min').astype(int)
-
-    ranking_cols = [
-        'n_sessions','mean_net','std_net','median_net','win_rate','risk_of_ruin','mean_drawdown','ev_per_hand','composite_score','rank'
-    ]
-    ranking = stats.reset_index()[['strategy'] + ranking_cols]
-    ranking = ranking.sort_values('composite_score', ascending=False)
+    # Attach Kelly sizing (informational only; not part of the composite score)
+    kelly_path = os.path.join(outdir, 'kelly.csv')
+    if os.path.exists(kelly_path):
+        try:
+            k = pd.read_csv(kelly_path)[['strategy', 'edge_per_unit', 'kelly_fraction', 'kelly_bet']]
+            ranking = ranking.merge(k, on='strategy', how='left')
+        except Exception:
+            pass
     ranking.to_csv(os.path.join(outdir, 'strategy_ranking.csv'), index=False)
 
     # Print top recommendation

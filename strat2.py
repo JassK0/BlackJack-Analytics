@@ -59,14 +59,14 @@ def hand_total(hand: List[str]) -> int:
     return total
 
 def is_soft(hand: List[str]) -> bool:
-    # Soft if an Ace can count as 11 without bust
+    # Soft if an Ace is still counted as 11 after demoting aces to avoid a bust
     total, aces = 0, 0
     for c in hand:
         total += VALUES[c]
         if c == 'A': aces += 1
     while total > 21 and aces:
         total -= 10; aces -= 1
-    return ('A' in hand) and (total <= 11)
+    return aces > 0
 
 def dealer_peek_if_needed(upcard: str, hole: str) -> bool:
     if upcard in ('A','10','J','Q','K'):
@@ -211,11 +211,12 @@ class OscarsGrind(StrategyBase):
         return cap_bet(self.current_units * u, bankroll, self.rules.table_max)
 
 def make_strategy(cfg: StrategyConfig, rules: TableRules) -> StrategyBase:
-    if cfg.kind == 'flat': return Flat(cfg.bet_base if hasattr(cfg,'bet_base') else 25, rules)
-    if cfg.kind == 'martingale': return Martingale(25, rules, cfg.mart_reset_on_win, cfg.mart_reset_on_push)
-    if cfg.kind == 'paroli': return Paroli(25, rules, cfg.paroli_streak_cap, cfg.paroli_reset_on_push)
-    if cfg.kind == '1326': return OneThreeTwoSix(25, rules, cfg.seq_reset_on_push)
-    if cfg.kind == 'oscars_grind': return OscarsGrind(25, rules, cfg.osc_reset_on_push)
+    unit = getattr(cfg, 'bet_base', 25)
+    if cfg.kind == 'flat': return Flat(unit, rules)
+    if cfg.kind == 'martingale': return Martingale(unit, rules, cfg.mart_reset_on_win, cfg.mart_reset_on_push)
+    if cfg.kind == 'paroli': return Paroli(unit, rules, cfg.paroli_streak_cap, cfg.paroli_reset_on_push)
+    if cfg.kind == '1326': return OneThreeTwoSix(unit, rules, cfg.seq_reset_on_push)
+    if cfg.kind == 'oscars_grind': return OscarsGrind(unit, rules, cfg.osc_reset_on_push)
     raise ValueError("Unknown strategy")
 
 # --------- Simulation (with logging) ---------
@@ -349,10 +350,10 @@ def run_session(strategy_cfg: StrategyConfig,
     session_id = str(uuid.uuid4())[:8]
     shoe = build_shoe(rules.num_decks)
     bankroll = bank_cfg.starting_bankroll
-    strat = make_strategy(strategy_cfg, rules)
-    # bind base to strategy if absent
+    # bind base to strategy if absent (before building it, so the unit applies)
     if not hasattr(strategy_cfg, 'bet_base'):
         strategy_cfg.bet_base = bank_cfg.bet_base
+    strat = make_strategy(strategy_cfg, rules)
 
     stake = strat.start_bet(bankroll)
     outcomes = {'W':0,'L':0,'P':0}
@@ -361,6 +362,7 @@ def run_session(strategy_cfg: StrategyConfig,
     table_max_hits = 0
     max_peak = bankroll
     max_drawdown = 0
+    stake_total = 0
 
     for i in range(1, bank_cfg.rounds+1):
         if bankroll <= 0: break
@@ -369,6 +371,7 @@ def run_session(strategy_cfg: StrategyConfig,
             table_max_hits += 1
 
         before = bankroll
+        stake_total += stake
         bankroll, outcome, profit, extras = play_hand(shoe, bankroll, stake, rules)
         outcomes[outcome] += 1
         bankroll_track.append(bankroll)
@@ -403,7 +406,7 @@ def run_session(strategy_cfg: StrategyConfig,
         net=bankroll - bank_cfg.starting_bankroll,
         win=outcomes['W'], lose=outcomes['L'], push=outcomes['P'],
         win_rate=win_rate,
-        avg_stake=(sum(h.stake for h in handlogs)/total if total else 0.0),
+        avg_stake=(stake_total/total if total else 0.0),
         max_drawdown=max_drawdown,
         table_max_hits=table_max_hits,
         bust=int(bankroll <= 0),
