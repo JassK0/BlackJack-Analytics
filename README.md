@@ -2,6 +2,8 @@
 
 🃏 A blackjack lab and arcade that runs entirely in your browser. It has a Monte Carlo simulator that shows how betting systems really perform, plus three blackjack games built on the same engine.
 
+**▶ Try it live: [black-jack-analytics.vercel.app](https://black-jack-analytics.vercel.app/)**. Nothing to install.
+
 > **TL;DR: the house always wins.** Betting systems only change *how* you lose. Card counting is the one strategy that actually tilts the odds, which is why one of the games is all about it.
 
 ---
@@ -23,7 +25,7 @@ There is no server, account or database. The app does every calculation in your 
 
 ## 🚀 Quick start
 
-You need [Node.js](https://nodejs.org) 20 or newer.
+To just use it, open the [live site](https://black-jack-analytics.vercel.app/). To run it yourself, you need [Node.js](https://nodejs.org) 20 or newer.
 
 ```
 npm install
